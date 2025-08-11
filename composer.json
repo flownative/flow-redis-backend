@@ -1,0 +1,13 @@
+{
+    "name": "flownative/redis-backend",
+    "description": "Opinionated Redis backend with persistent and lazy connections.",
+    "type": "library",
+    "license": "MIT",
+    "require": {
+        "php": "^8.0",
+        "neos/cache": "^8.3 || ^9.0 || dev-main"
+    },
+    "autoload": {
+        "psr-4": {"Flownative\\RedisBackend\\": "src"}
+    }
+}
