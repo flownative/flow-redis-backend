@@ -3,6 +3,8 @@ declare(strict_types=1);
 
 namespace Flownative\RedisBackend;
 
+use Neos\Cache\EnvironmentConfiguration;
+
 /**
  * A more opinionated version of the default redis backend
  * for testing the changes in here in production environments.
