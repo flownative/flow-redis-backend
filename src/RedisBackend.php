@@ -13,6 +13,21 @@ namespace Flownative\RedisBackend;
  */
 class RedisBackend extends \Neos\Cache\Backend\RedisBackend
 {
+    /**
+     * Constructs this backend
+     *
+     * @param EnvironmentConfiguration $environmentConfiguration
+     * @param array $options Configuration options - depends on the actual backend
+     * @throws CacheException
+     */
+    public function __construct(EnvironmentConfiguration $environmentConfiguration, array $options)
+    {
+        parent::__construct($environmentConfiguration, $options);
+        if (!$this->redis instanceof \Redis) {
+            $this->redis = $this->getRedisClient();
+        }
+    }
+    
     private function getRedisClient(): \Redis
     {
         $configuration = [
