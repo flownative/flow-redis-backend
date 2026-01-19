@@ -497,7 +497,7 @@ class RedisBackend extends \Neos\Cache\Backend\AbstractBackend implements Taggab
             'host' => $this->hostname,
             'readTimeout' => 10,
             'connectTimeout' => 10,
-            'persistent' => $this->identifierPrefix,
+            'persistent' => false,
             'backoff' => [
                 'algorithm' => \Redis::BACKOFF_ALGORITHM_DECORRELATED_JITTER,
                 'base' => 10,
