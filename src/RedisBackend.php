@@ -179,11 +179,11 @@ class RedisBackend extends \Neos\Cache\Backend\AbstractBackend implements Taggab
             $this->redis->watch($tagsKey);
             $tags = $this->redis->sMembers($tagsKey);
             $this->redis->multi();
-            $this->redis->del($this->getPrefixedIdentifier('entry:' . $entryIdentifier));
+            $this->redis->unlink($this->getPrefixedIdentifier('entry:' . $entryIdentifier));
             foreach ($tags as $tag) {
                 $this->redis->sRem($this->getPrefixedIdentifier('tag:' . $tag), $entryIdentifier);
             }
-            $this->redis->del($this->getPrefixedIdentifier('tags:' . $entryIdentifier));
+            $this->redis->unlink($this->getPrefixedIdentifier('tags:' . $entryIdentifier));
             $result = $this->redis->exec();
         } while ($result === false);
 
@@ -212,7 +212,7 @@ class RedisBackend extends \Neos\Cache\Backend\AbstractBackend implements Taggab
             cursor = result[1]
             local keys = result[2]
             for _, key in ipairs(keys) do
-                redis.call('DEL', key)
+                redis.call('UNLINK', key)
             end
         until cursor == '0'
         ";
@@ -249,16 +249,16 @@ class RedisBackend extends \Neos\Cache\Backend\AbstractBackend implements Taggab
         $script = "
         local entries = redis.call('SMEMBERS', KEYS[1])
         for k1,entryIdentifier in ipairs(entries) do
-            redis.call('DEL', ARGV[1]..'entry:'..entryIdentifier)
+            redis.call('UNLINK', ARGV[1]..'entry:'..entryIdentifier)
 
             local tags = redis.call('SMEMBERS', ARGV[1]..'tags:'..entryIdentifier)
             for k2,tagName in ipairs(tags) do
                 redis.call('SREM', ARGV[1]..'tag:'..tagName, entryIdentifier)
             end
 
-            redis.call('DEL', ARGV[1]..'tags:'..entryIdentifier)
+            redis.call('UNLINK', ARGV[1]..'tags:'..entryIdentifier)
         end
-        redis.call('DEL', KEYS[1])
+        redis.call('UNLINK', KEYS[1])
         return #entries
         ";
         return $this->redis->eval($script, [$this->getPrefixedIdentifier('tag:' . $tag), $this->getPrefixedIdentifier('')], 1);
