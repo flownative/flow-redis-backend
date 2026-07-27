@@ -34,3 +34,21 @@ with
 `backend: 'Flownative\RedisBackend\RedisBackend'`
 
 All options remain the same.
+
+## Cache tag integrity
+
+Redis can evict an entry value, its reverse tag set, and its forward tag sets
+independently. This backend validates both directions of the tag index before
+returning a cache hit. If any part is missing, the entry is removed and
+reported as a cache miss so the application can rebuild it instead of serving
+content that can no longer be invalidated by tag.
+
+Untagged entries receive an internal marker, which makes a missing reverse tag
+set detectable for them as well. Existing tagged entries written by an older
+version remain compatible. Existing untagged entries are rebuilt once.
+
+New tag indexes inherit finite entry lifetimes instead of becoming persistent
+when their Redis key does not exist yet.
+
+Persistent connections are scoped by the Neos cache identifier. Failed write
+transactions are discarded before the connection can be reused.

@@ -11,6 +11,7 @@ use Neos\Cache\Backend\TaggableBackendInterface;
 use Neos\Cache\Backend\WithStatusInterface;
 use Neos\Cache\EnvironmentConfiguration;
 use Neos\Cache\Exception as CacheException;
+use Neos\Cache\Frontend\FrontendInterface;
 use Neos\Error\Messages\Error;
 use Neos\Error\Messages\Notice;
 use Neos\Error\Messages\Result;
@@ -28,6 +29,11 @@ class RedisBackend extends \Neos\Cache\Backend\AbstractBackend implements Taggab
     use RequireOnceFromValueTrait;
 
     public const MIN_REDIS_VERSION = '6.0.0';
+
+    /**
+     * Stored in the reverse tag set so that untagged entries also have integrity metadata.
+     */
+    private const ENTRY_TAG_SENTINEL = "\0flownative-entry\0";
 
     /**
      * @var \Redis
@@ -66,6 +72,15 @@ class RedisBackend extends \Neos\Cache\Backend\AbstractBackend implements Taggab
     public function __construct(EnvironmentConfiguration $environmentConfiguration, array $options)
     {
         parent::__construct($environmentConfiguration, $options);
+    }
+
+    /**
+     * The cache identifier is part of the persistent connection ID, so the
+     * lazy Redis client must be created after the frontend has been assigned.
+     */
+    public function setCache(FrontendInterface $cache): void
+    {
+        parent::setCache($cache);
         if (!$this->redis instanceof \Redis) {
             $this->redis = $this->getRedisClient();
         }
@@ -82,7 +97,7 @@ class RedisBackend extends \Neos\Cache\Backend\AbstractBackend implements Taggab
      * @throws CacheException
      * @api
      */
-    public function set(string $entryIdentifier, string $data, array $tags = [], int $lifetime = null): void
+    public function set(string $entryIdentifier, string $data, array $tags = [], ?int $lifetime = null): void
     {
         if ($this->isFrozen()) {
             throw new \RuntimeException(sprintf('Cannot add or modify cache entry because the backend of cache "%s" is frozen.', $this->cacheIdentifier), 1323344192);
@@ -97,29 +112,42 @@ class RedisBackend extends \Neos\Cache\Backend\AbstractBackend implements Taggab
             $setOptions['ex'] = $lifetime;
         }
 
-        $redisTags = array_reduce($tags, function ($redisTags, $tag) use ($lifetime, $entryIdentifier) {
-            $expire = $this->calculateExpires($this->getPrefixedIdentifier('tag:' . $tag), $lifetime);
-            $redisTags[] = ['key' => $this->getPrefixedIdentifier('tag:' . $tag), 'value' => $entryIdentifier, 'expire' => $expire];
+        $tags = array_values(array_unique($tags));
+        $reverseTagKey = $this->getPrefixedIdentifier('tags:' . $entryIdentifier);
+        $reverseTagExpire = $this->calculateExpires($reverseTagKey, $lifetime);
+        $redisTags = array_map(function (string $tag) use ($lifetime, $entryIdentifier): array {
+            $key = $this->getPrefixedIdentifier('tag:' . $tag);
+            return [
+                'key' => $key,
+                'value' => $entryIdentifier,
+                'expire' => $this->calculateExpires($key, $lifetime)
+            ];
+        }, $tags);
 
-            $expire = $this->calculateExpires($this->getPrefixedIdentifier('tags:' . $entryIdentifier), $lifetime);
-            $redisTags[] = ['key' => $this->getPrefixedIdentifier('tags:' . $entryIdentifier), 'value' => $tag, 'expire' => $expire];
-            return $redisTags;
-        }, []);
+        try {
+            $this->beginTransaction('writing cache entry');
 
-        $this->redis->multi();
-        $result = $this->redis->set($this->getPrefixedIdentifier('entry:' . $entryIdentifier), $this->compress($data), $setOptions);
-        if (!$result instanceof \Redis) {
-            $this->verifyRedisVersionIsSupported();
-        }
-        foreach ($redisTags as $tag) {
-            $this->redis->sAdd($tag['key'], $tag['value']);
-            if ($tag['expire'] > 0) {
-                $this->redis->expire($tag['key'], $tag['expire']);
-            } else {
-                $this->redis->persist($tag['key']);
+            $this->redis->set($this->getPrefixedIdentifier('entry:' . $entryIdentifier), $this->compress($data), $setOptions);
+            $this->redis->sAdd($reverseTagKey, self::ENTRY_TAG_SENTINEL, ...$tags);
+            $this->queueExpiration($reverseTagKey, $reverseTagExpire);
+            foreach ($redisTags as $tag) {
+                $this->redis->sAdd($tag['key'], $tag['value']);
+                $this->queueExpiration($tag['key'], $tag['expire']);
             }
+
+            $results = $this->redis->exec();
+            if (!is_array($results)) {
+                throw new CacheException('Redis transaction failed while writing cache entry.', 1753614722);
+            }
+
+            $this->verifySetTransactionResults($results, count($redisTags));
+        } catch (\Throwable $exception) {
+            $this->discardTransaction();
+            if ($exception instanceof CacheException) {
+                throw $exception;
+            }
+            throw new CacheException('Redis transaction failed while writing cache entry: ' . $exception->getMessage(), 1753614723, $exception);
         }
-        $this->redis->exec();
     }
 
     /**
@@ -128,10 +156,79 @@ class RedisBackend extends \Neos\Cache\Backend\AbstractBackend implements Taggab
     private function calculateExpires(string $tag, int $lifetime): int
     {
         $ttl = (int)$this->redis->ttl($tag);
-        if ($ttl < 0 || $lifetime === self::UNLIMITED_LIFETIME) {
+        if ($ttl === -1 || $lifetime === self::UNLIMITED_LIFETIME) {
             return -1;
         }
+        if ($ttl === -2) {
+            return $lifetime;
+        }
         return max($ttl, $lifetime);
+    }
+
+    private function queueExpiration(string $key, int $expire): void
+    {
+        if ($expire > 0) {
+            $this->redis->expire($key, $expire);
+        } else {
+            $this->redis->persist($key);
+        }
+    }
+
+    /**
+     * SET and SADD must succeed. PERSIST may legitimately return false if a
+     * set was already persistent; EXPIRE cannot fail after a successful SADD.
+     *
+     * @param array<int, mixed> $results
+     * @throws CacheException
+     */
+    private function verifySetTransactionResults(array $results, int $tagCount): void
+    {
+        if (count($results) !== 3 + ($tagCount * 2)) {
+            throw new CacheException('Redis transaction returned an unexpected number of results while writing cache entry.', 1753614724);
+        }
+
+        $requiredResultIndexes = [0, 1];
+        for ($index = 0; $index < $tagCount; $index++) {
+            $requiredResultIndexes[] = 3 + ($index * 2);
+        }
+
+        foreach ($requiredResultIndexes as $resultIndex) {
+            if (!array_key_exists($resultIndex, $results) || $results[$resultIndex] === false) {
+                throw new CacheException('Redis transaction contained a failed command while writing cache entry.', 1753614725);
+            }
+        }
+    }
+
+    private function discardTransaction(): void
+    {
+        try {
+            $this->redis->discard();
+        } catch (\Throwable) {
+            // The transaction may already have been executed or the connection may be unavailable.
+        }
+        try {
+            $this->redis->unwatch();
+        } catch (\Throwable) {
+            // The connection may be unavailable.
+        }
+    }
+
+    /**
+     * @throws CacheException
+     */
+    private function beginTransaction(string $operation): void
+    {
+        try {
+            $result = $this->redis->multi();
+        } catch (\Throwable $exception) {
+            $this->discardTransaction();
+            throw new CacheException('Could not start Redis transaction while ' . $operation . ': ' . $exception->getMessage(), 1753614732, $exception);
+        }
+
+        if (!$result instanceof \Redis) {
+            $this->discardTransaction();
+            throw new CacheException('Could not start Redis transaction while ' . $operation . '.', 1753614733);
+        }
     }
 
     /**
@@ -143,7 +240,8 @@ class RedisBackend extends \Neos\Cache\Backend\AbstractBackend implements Taggab
      */
     public function get(string $entryIdentifier): string|bool
     {
-        return $this->uncompress($this->redis->get($this->getPrefixedIdentifier('entry:' . $entryIdentifier)));
+        $value = $this->readValidatedEntry($entryIdentifier, true);
+        return $value === false ? false : $this->uncompress((string)$value);
     }
 
     /**
@@ -155,8 +253,60 @@ class RedisBackend extends \Neos\Cache\Backend\AbstractBackend implements Taggab
      */
     public function has(string $entryIdentifier): bool
     {
-        // exists returned true or false in phpredis versions < 4.0.0, now it returns the number of keys
-        return (bool)$this->redis->exists($this->getPrefixedIdentifier('entry:' . $entryIdentifier));
+        return (bool)$this->readValidatedEntry($entryIdentifier, false);
+    }
+
+    /**
+     * Only serve an entry when its reverse tag set and every forward tag
+     * membership still exist. Redis eviction treats these keys independently,
+     * so an incomplete tag index must be handled as a cache miss.
+     */
+    private function readValidatedEntry(string $entryIdentifier, bool $returnValue): bool|string
+    {
+        // language=lua
+        $script = "
+        local value = redis.call('GET', KEYS[1])
+        if value == false then
+            return false
+        end
+
+        local tags = redis.call('SMEMBERS', KEYS[2])
+        if #tags == 0 then
+            redis.call('UNLINK', KEYS[1])
+            return false
+        end
+
+        for _, tagName in ipairs(tags) do
+            if tagName ~= ARGV[3] and redis.call('SISMEMBER', ARGV[1]..'tag:'..tagName, ARGV[2]) == 0 then
+                for _, cleanupTagName in ipairs(tags) do
+                    if cleanupTagName ~= ARGV[3] then
+                        redis.call('SREM', ARGV[1]..'tag:'..cleanupTagName, ARGV[2])
+                    end
+                end
+                redis.call('UNLINK', KEYS[1], KEYS[2])
+                return false
+            end
+        end
+
+        if ARGV[4] == '1' then
+            return value
+        end
+        return true
+        ";
+
+        $result = $this->redis->eval($script, [
+            $this->getPrefixedIdentifier('entry:' . $entryIdentifier),
+            $this->getPrefixedIdentifier('tags:' . $entryIdentifier),
+            $this->getPrefixedIdentifier(''),
+            $entryIdentifier,
+            self::ENTRY_TAG_SENTINEL,
+            $returnValue ? '1' : '0'
+        ], 2);
+
+        if ($returnValue) {
+            return is_string($result) ? $result : false;
+        }
+        return $result !== false;
     }
 
     /**
@@ -175,16 +325,35 @@ class RedisBackend extends \Neos\Cache\Backend\AbstractBackend implements Taggab
             throw new \RuntimeException(sprintf('Cannot remove cache entry because the backend of cache "%s" is frozen.', $this->cacheIdentifier), 1323344192);
         }
         do {
-            $tagsKey = $this->getPrefixedIdentifier('tags:' . $entryIdentifier);
-            $this->redis->watch($tagsKey);
-            $tags = $this->redis->sMembers($tagsKey);
-            $this->redis->multi();
-            $this->redis->unlink($this->getPrefixedIdentifier('entry:' . $entryIdentifier));
-            foreach ($tags as $tag) {
-                $this->redis->sRem($this->getPrefixedIdentifier('tag:' . $tag), $entryIdentifier);
+            try {
+                $tagsKey = $this->getPrefixedIdentifier('tags:' . $entryIdentifier);
+                if ($this->redis->watch($tagsKey) !== true) {
+                    throw new CacheException('Could not watch cache tags while removing cache entry.', 1753614734);
+                }
+                $tags = $this->redis->sMembers($tagsKey);
+                if (!is_array($tags)) {
+                    throw new CacheException('Could not read cache tags while removing cache entry.', 1753614726);
+                }
+                $this->beginTransaction('removing cache entry');
+                $this->redis->unlink($this->getPrefixedIdentifier('entry:' . $entryIdentifier));
+                foreach ($tags as $tag) {
+                    if ($tag === self::ENTRY_TAG_SENTINEL) {
+                        continue;
+                    }
+                    $this->redis->sRem($this->getPrefixedIdentifier('tag:' . $tag), $entryIdentifier);
+                }
+                $this->redis->unlink($this->getPrefixedIdentifier('tags:' . $entryIdentifier));
+                $result = $this->redis->exec();
+                if ($result !== false && !is_array($result)) {
+                    throw new CacheException('Redis transaction returned an invalid result while removing cache entry.', 1753614727);
+                }
+            } catch (\Throwable $exception) {
+                $this->discardTransaction();
+                if ($exception instanceof CacheException) {
+                    throw $exception;
+                }
+                throw new CacheException('Redis transaction failed while removing cache entry: ' . $exception->getMessage(), 1753614728, $exception);
             }
-            $this->redis->unlink($this->getPrefixedIdentifier('tags:' . $entryIdentifier));
-            $result = $this->redis->exec();
         } while ($result === false);
 
         // Reset iterator because it will be out of sync after a removal
@@ -393,14 +562,27 @@ class RedisBackend extends \Neos\Cache\Backend\AbstractBackend implements Taggab
             throw new \RuntimeException(sprintf('Cannot add or modify cache entry because the backend of cache "%s" is frozen.', $this->cacheIdentifier), 1323344192);
         }
         do {
-            $iterator = $this->getEntryIterator();
-            $this->redis->multi();
-            foreach ($iterator as $entryIdentifier) {
-                $this->redis->persist($this->getPrefixedIdentifier('entry:' . $entryIdentifier));
+            try {
+                $iterator = $this->getEntryIterator();
+                $this->beginTransaction('freezing cache');
+                foreach ($iterator as $entryIdentifier) {
+                    $this->redis->persist($this->getPrefixedIdentifier('entry:' . $entryIdentifier));
+                }
+                /** @var array|bool $result */
+                $result = $this->redis->exec();
+                if ($result !== false && !is_array($result)) {
+                    throw new CacheException('Redis transaction returned an invalid result while freezing cache.', 1753614729);
+                }
+                if ($result !== false && $this->redis->set($this->getPrefixedIdentifier('frozen'), 1) === false) {
+                    throw new CacheException('Could not persist frozen cache state.', 1753614730);
+                }
+            } catch (\Throwable $exception) {
+                $this->discardTransaction();
+                if ($exception instanceof CacheException) {
+                    throw $exception;
+                }
+                throw new CacheException('Redis transaction failed while freezing cache: ' . $exception->getMessage(), 1753614731, $exception);
             }
-            /** @var array|bool $result */
-            $result = $this->redis->exec();
-            $this->redis->set($this->getPrefixedIdentifier('frozen'), 1);
         } while ($result === false);
         $this->frozen = true;
     }
@@ -466,7 +648,7 @@ class RedisBackend extends \Neos\Cache\Backend\AbstractBackend implements Taggab
         $this->batchSize = (int)$batchSize;
     }
 
-    public function setRedis(\Redis $redis = null): void
+    public function setRedis(?\Redis $redis = null): void
     {
         if ($redis !== null) {
             $this->redis = $redis;
@@ -497,7 +679,7 @@ class RedisBackend extends \Neos\Cache\Backend\AbstractBackend implements Taggab
             'host' => $this->hostname,
             'readTimeout' => 10,
             'connectTimeout' => 10,
-            'persistent' => false,
+            'persistent' => $this->identifierPrefix,
             'backoff' => [
                 'algorithm' => \Redis::BACKOFF_ALGORITHM_DECORRELATED_JITTER,
                 'base' => 10,
