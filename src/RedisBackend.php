@@ -353,7 +353,8 @@ class RedisBackend extends \Neos\Cache\Backend\AbstractBackend implements Taggab
     {
         $entryIdentifier = $this->getEntryIterator()->current();
 
-        if (!$entryIdentifier || !$this->has($entryIdentifier)) {
+        // Keep the snapshot key stable if the entry disappears after valid().
+        if (!$entryIdentifier) {
             return false;
         }
 
@@ -365,7 +366,8 @@ class RedisBackend extends \Neos\Cache\Backend\AbstractBackend implements Taggab
      */
     public function valid(): bool
     {
-        return $this->key() !== false;
+        $entryIdentifier = $this->key();
+        return $entryIdentifier !== false && $this->has($entryIdentifier);
     }
 
     /**

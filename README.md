@@ -34,3 +34,15 @@ with
 `backend: 'Flownative\RedisBackend\RedisBackend'`
 
 All options remain the same.
+
+## Tests
+
+The functional tests require the PHP Redis extension and a local Redis server.
+Each test uses a unique cache identifier and cleans up only its own cache keys.
+
+```sh
+composer install
+REDIS_HOST=127.0.0.1 composer test
+```
+
+`REDIS_PORT` (default `6379`) and `REDIS_DATABASE` (default `0`) are optional.
