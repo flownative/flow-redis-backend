@@ -1,6 +1,6 @@
 {
     "name": "flownative/redis-backend",
-    "description": "Opinionated Redis backend with persistent and lazy connections.",
+    "description": "Opinionated Redis backend with timeouts and retries for the connection.",
     "type": "library",
     "license": "MIT",
     "require": {
