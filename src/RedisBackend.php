@@ -42,6 +42,8 @@ class RedisBackend extends \Neos\Cache\Backend\AbstractBackend implements Taggab
 
     protected int $database = 0;
 
+    protected string $username = '';
+
     protected string $password = '';
 
     protected int $compressionLevel = 0;
@@ -446,6 +448,11 @@ class RedisBackend extends \Neos\Cache\Backend\AbstractBackend implements Taggab
         $this->database = (int)$database;
     }
 
+    public function setUsername(string $username): void
+    {
+        $this->username = $username;
+    }
+
     public function setPassword(string $password): void
     {
         $this->password = $password;
@@ -509,7 +516,9 @@ class RedisBackend extends \Neos\Cache\Backend\AbstractBackend implements Taggab
             $configuration['port'] = $this->port;
         }
 
-        if ($this->password !== '') {
+        if ($this->username !== '' && $this->password !== '') {
+            $configuration['auth'] = [$this->username, $this->password];
+        } elseif ($this->password !== '') {
             $configuration['auth'] = [$this->password];
         }
 
