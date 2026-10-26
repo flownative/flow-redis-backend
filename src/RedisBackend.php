@@ -313,7 +313,7 @@ class RedisBackend extends \Neos\Cache\Backend\AbstractBackend implements Taggab
             $values = array_fill(0, count($keys), $this->getPrefixedIdentifier(''));
 
             $flushedEntries = $this->redis->eval($script, array_merge($keys, $values), count($keys));
-            $flushedEntriesTotal = is_int($flushedEntries) ? $flushedEntries : 0;
+            $flushedEntriesTotal += is_int($flushedEntries) ? $flushedEntries : 0;
         }
 
         return $flushedEntriesTotal;
