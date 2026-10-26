@@ -42,6 +42,8 @@ class RedisBackend extends \Neos\Cache\Backend\AbstractBackend implements Taggab
 
     protected int $database = 0;
 
+    protected string $username = '';
+
     protected string $password = '';
 
     protected int $compressionLevel = 0;
@@ -82,7 +84,7 @@ class RedisBackend extends \Neos\Cache\Backend\AbstractBackend implements Taggab
      * @throws CacheException
      * @api
      */
-    public function set(string $entryIdentifier, string $data, array $tags = [], int $lifetime = null): void
+    public function set(string $entryIdentifier, string $data, array $tags = [], ?int $lifetime = null): void
     {
         if ($this->isFrozen()) {
             throw new \RuntimeException(sprintf('Cannot add or modify cache entry because the backend of cache "%s" is frozen.', $this->cacheIdentifier), 1323344192);
@@ -311,7 +313,7 @@ class RedisBackend extends \Neos\Cache\Backend\AbstractBackend implements Taggab
             $values = array_fill(0, count($keys), $this->getPrefixedIdentifier(''));
 
             $flushedEntries = $this->redis->eval($script, array_merge($keys, $values), count($keys));
-            $flushedEntriesTotal = is_int($flushedEntries) ? $flushedEntries : 0;
+            $flushedEntriesTotal += is_int($flushedEntries) ? $flushedEntries : 0;
         }
 
         return $flushedEntriesTotal;
@@ -446,6 +448,11 @@ class RedisBackend extends \Neos\Cache\Backend\AbstractBackend implements Taggab
         $this->database = (int)$database;
     }
 
+    public function setUsername(string $username): void
+    {
+        $this->username = $username;
+    }
+
     public function setPassword(string $password): void
     {
         $this->password = $password;
@@ -466,7 +473,7 @@ class RedisBackend extends \Neos\Cache\Backend\AbstractBackend implements Taggab
         $this->batchSize = (int)$batchSize;
     }
 
-    public function setRedis(\Redis $redis = null): void
+    public function setRedis(?\Redis $redis = null): void
     {
         if ($redis !== null) {
             $this->redis = $redis;
@@ -509,7 +516,9 @@ class RedisBackend extends \Neos\Cache\Backend\AbstractBackend implements Taggab
             $configuration['port'] = $this->port;
         }
 
-        if ($this->password !== '') {
+        if ($this->username !== '' && $this->password !== '') {
+            $configuration['auth'] = [$this->username, $this->password];
+        } elseif ($this->password !== '') {
             $configuration['auth'] = [$this->password];
         }
 
